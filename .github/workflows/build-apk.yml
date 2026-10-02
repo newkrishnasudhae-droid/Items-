@@ -1,0 +1,339 @@
+name: Build Product Price Book APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # 1. Checkout
+      - name: Checkout
+        uses: actions/checkout@v4
+
+
+      # 2. Java 17
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+
+      # 3. Auto Extract ZIP
+      - name: Auto Extract ZIP
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p extracted
+
+          FOUND=0
+
+          while IFS= read -r -d '' ZIP
+          do
+            echo "ZIP FOUND: $ZIP"
+
+            NAME="$(basename "$ZIP" .zip)"
+
+            mkdir -p "extracted/$NAME"
+
+            unzip -oq "$ZIP" -d "extracted/$NAME"
+
+            FOUND=1
+
+          done < <(
+            find . \
+              -type f \
+              -name "*.zip" \
+              -not -path "./.git/*" \
+              -not -path "./extracted/*" \
+              -print0
+          )
+
+          if [ "$FOUND" = "0" ]; then
+            echo "No ZIP found. Checking current project."
+          fi
+
+
+      # 4. Find Android Project
+      - name: Find Android Project
+        shell: bash
+        run: |
+          set -e
+
+          if [ -f "settings.gradle" ] || \
+             [ -f "settings.gradle.kts" ]; then
+
+            echo "Android project found in root."
+
+          else
+
+            PROJECT_FILE="$(
+              find extracted \
+                -type f \
+                \( \
+                  -name "settings.gradle" \
+                  -o \
+                  -name "settings.gradle.kts" \
+                \) \
+                | head -n 1
+            )"
+
+            if [ -z "$PROJECT_FILE" ]; then
+              echo "ERROR: Android project not found."
+              exit 1
+            fi
+
+            PROJECT_DIR="$(dirname "$PROJECT_FILE")"
+
+            echo "Project directory:"
+            echo "$PROJECT_DIR"
+
+            cp -a "$PROJECT_DIR"/. .
+
+          fi
+
+          echo ""
+          echo "PROJECT FILES:"
+          ls -la
+
+
+      # 5. Check App
+      - name: Check Android Project
+        shell: bash
+        run: |
+          set -e
+
+          if [ ! -d "app" ]; then
+            echo "ERROR: app folder not found."
+            exit 1
+          fi
+
+          if [ ! -f "settings.gradle" ] &&
+             [ ! -f "settings.gradle.kts" ]; then
+            echo "ERROR: settings.gradle not found."
+            exit 1
+          fi
+
+          echo "Android project OK."
+
+
+      # 6. Install Android SDK 35
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -e
+
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -f "$SDKMANAGER" ]; then
+            SDKMANAGER="$(
+              find "$ANDROID_SDK_ROOT/cmdline-tools" \
+                -type f \
+                -name sdkmanager \
+                | head -n 1
+            )"
+          fi
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found."
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses \
+            >/dev/null 2>&1 || true
+
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+
+      # 7. Fix Product Class
+      - name: Fix Product Java
+        shell: bash
+        run: |
+          set -e
+
+          FILE="app/src/main/java/com/productpricebook/app/MainActivity.java"
+
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR:"
+            echo "$FILE not found."
+            exit 1
+          fi
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path(
+              "app/src/main/java/com/productpricebook/app/MainActivity.java"
+          )
+
+          s = p.read_text(encoding="utf-8")
+
+          # Product must be a static nested class
+          s = re.sub(
+              r'(?m)^(\s*)class\s+Product\s*\{',
+              r'\1static class Product {',
+              s,
+              count=1
+          )
+
+          # Product.from must be static
+          s = re.sub(
+              r'\bProduct\s+from\s*\(\s*JSONObject\s+o\s*\)',
+              'static Product from(JSONObject o)',
+              s
+          )
+
+          # Prevent duplicate static
+          s = s.replace(
+              "static static Product from",
+              "static Product from"
+          )
+
+          p.write_text(s, encoding="utf-8")
+
+          print("Product class fixed.")
+          PY
+
+
+      # 8. Fix Manifest
+      - name: Fix AndroidManifest
+        shell: bash
+        run: |
+          set -e
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          pattern = re.compile(
+              r'&(?!amp;|lt;|gt;|quot;|apos;|#[0-9]+;|#x[0-9A-Fa-f]+;)'
+          )
+
+          for p in Path(".").rglob("AndroidManifest.xml"):
+
+              if ".git" in p.parts:
+                  continue
+
+              try:
+                  s = p.read_text(encoding="utf-8")
+              except:
+                  continue
+
+              fixed = pattern.sub("&amp;", s)
+
+              if fixed != s:
+                  p.write_text(fixed, encoding="utf-8")
+                  print("Manifest fixed:", p)
+
+          PY
+
+
+      # 9. Setup Gradle
+      - name: Setup Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+
+      # 10. Verify Gradle
+      - name: Verify Gradle
+        shell: bash
+        run: |
+          set -e
+
+          gradle --version
+
+
+      # 11. Build APK
+      #
+      # IMPORTANT:
+      # DO NOT USE ./gradlew
+      #
+      # Your project has no gradlew.
+      # Setup Gradle provides "gradle".
+      #
+      - name: Build APK
+        shell: bash
+        run: |
+          set -e
+
+          echo "======================================"
+          echo "BUILDING APK"
+          echo "======================================"
+
+          gradle clean assembleDebug \
+            --stacktrace \
+            --no-daemon
+
+          echo ""
+          echo "BUILD COMPLETED."
+
+
+      # 12. Find APK
+      - name: Find APK
+        shell: bash
+        run: |
+          set -e
+
+          echo "======================================"
+          echo "APK FILES"
+          echo "======================================"
+
+          find . \
+            -type f \
+            -name "*.apk" \
+            -not -path "./.git/*"
+
+
+      # 13. Prepare APK
+      - name: Prepare APK
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p release
+
+          APK="$(
+            find app/build/outputs \
+              -type f \
+              -name "*.apk" \
+              | head -n 1
+          )"
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
+          echo "APK:"
+          echo "$APK"
+
+          cp "$APK" \
+            "release/ProductPriceBook-debug.apk"
+
+          echo ""
+          echo "FINAL APK:"
+          ls -lh \
+            "release/ProductPriceBook-debug.apk"
+
+
+      # 14. Upload APK
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProductPriceBook-APK
+          path: release/ProductPriceBook-debug.apk
+          if-no-files-found: error
